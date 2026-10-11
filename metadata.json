@@ -1,0 +1,6 @@
+{
+  "name": "Autonomous Business Intelligence Platform",
+  "description": "Enterprise AI platform for automated retail sales validation, KPI analytics, machine learning forecasting, Isolation Forest anomaly detection, natural-language data querying, and executive PDF reporting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
