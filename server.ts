@@ -22,7 +22,11 @@ import {
   getDatasetPreview,
   getSalesAnalysisBreakdowns,
   getSalesTrend,
+  getUserFromSessionToken,
   listAllDatasets,
+  loginUserAccount,
+  registerUserAccount,
+  revokeUserSessionToken,
   saveCleanedDataset,
 } from './server/database.ts';
 import { runAnomalyDetection, runSalesForecast } from './server/mlEngine.ts';
@@ -70,6 +74,78 @@ async function startServer() {
       active_rows: active ? active.rows_accepted : 0,
       ai_backend: aiStatus,
     });
+  });
+
+  // 1B. User Authentication Endpoints (Login, Sign Up, Session Check, Logout)
+  app.post('/api/auth/register', (req, res) => {
+    try {
+      const { full_name, email, password, role } = req.body || {};
+      const result = registerUserAccount({ full_name, email, password, role });
+      res.json({
+        authenticated: true,
+        message: `Account created for ${result.user.full_name}.`,
+        user: result.user,
+        token: result.token,
+      });
+    } catch (error) {
+      res.status(400).json({
+        error: error instanceof Error ? error.message : 'Failed to create account.',
+      });
+    }
+  });
+
+  app.post('/api/auth/login', (req, res) => {
+    try {
+      const { email, password } = req.body || {};
+      const result = loginUserAccount({ email, password });
+      res.json({
+        authenticated: true,
+        message: `Signed in as ${result.user.full_name}.`,
+        user: result.user,
+        token: result.token,
+      });
+    } catch (error) {
+      res.status(401).json({
+        error: error instanceof Error ? error.message : 'Invalid login credentials.',
+      });
+    }
+  });
+
+  app.get('/api/auth/me', (req, res) => {
+    const authHeader = String(req.headers.authorization || '');
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const user = getUserFromSessionToken(token);
+    if (!user) {
+      res.json({ authenticated: false, user: null });
+      return;
+    }
+    res.json({ authenticated: true, user });
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    const authHeader = String(req.headers.authorization || '');
+    const headerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const token = headerToken || String(req.body?.token || '').trim();
+    revokeUserSessionToken(token);
+    res.json({ logged_out: true, message: 'Signed out of workspace session.' });
+  });
+
+  // Strict Authentication Gate Middleware for all protected /api/* routes
+  app.use('/api', (req, res, next) => {
+    if (req.path === '/health' || req.path.startsWith('/auth/')) {
+      next();
+      return;
+    }
+    const authHeader = String(req.headers.authorization || '');
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const user = getUserFromSessionToken(token);
+    if (!user) {
+      res.status(401).json({
+        error: 'Authentication required. Please sign in to access the platform.',
+      });
+      return;
+    }
+    next();
   });
 
   // 2. Upload CSV (supports multipart/form-data file OR JSON { csvContent, filename })
@@ -405,7 +481,7 @@ async function startServer() {
     });
   }
 
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Autonomous Business Intelligence Platform running on http://0.0.0.0:${PORT}`);
   });

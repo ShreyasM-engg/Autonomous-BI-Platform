@@ -9,6 +9,8 @@ import {
   FileText,
   Filter,
   LayoutDashboard,
+  LogIn,
+  LogOut,
   MessageSquare,
   Moon,
   RefreshCw,
@@ -19,11 +21,14 @@ import {
   Trash2,
   TrendingUp,
   Upload,
+  UserCheck,
+  UserPlus,
 } from 'lucide-react';
 import {
   AiBackendStatus,
   AiQueryResult,
   AnomalyResponse,
+  AuthUser,
   biApi,
   BusinessInsightCard,
   CategorySalesItem,
@@ -49,7 +54,8 @@ type NavPage =
   | 'ml'
   | 'ask'
   | 'reports'
-  | 'settings';
+  | 'settings'
+  | 'auth';
 
 const SUGGESTED_QUESTIONS = [
   'What are the total sales?',
@@ -82,6 +88,59 @@ export default function App() {
   }, [theme]);
 
   const [activePage, setActivePage] = useState<NavPage>('dashboard');
+
+  // User Authentication state (Login / Sign Up / Logout persisted in SQLite & localStorage)
+  const [authToken, setAuthToken] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('abi_auth_token') || '';
+    }
+    return '';
+  });
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin');
+  const [authFullName, setAuthFullName] = useState<string>('');
+  const [authEmail, setAuthEmail] = useState<string>('');
+  const [authPassword, setAuthPassword] = useState<string>('');
+  const [authConfirmPassword, setAuthConfirmPassword] = useState<string>('');
+  const [authRole, setAuthRole] = useState<string>('Lead BI Analyst');
+  const [authSubmitting, setAuthSubmitting] = useState<boolean>(false);
+  const [authBanner, setAuthBanner] = useState<{
+    type: 'success' | 'error';
+    message: string;
+  } | null>(null);
+
+  const [authChecking, setAuthChecking] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      return Boolean(localStorage.getItem('abi_auth_token'));
+    }
+    return false;
+  });
+
+  useEffect(() => {
+    if (!authToken) {
+      setCurrentUser(null);
+      setAuthChecking(false);
+      return;
+    }
+    setAuthChecking(true);
+    biApi
+      .getCurrentUser(authToken)
+      .then((res) => {
+        if (res.authenticated && res.user) {
+          setCurrentUser(res.user);
+        } else {
+          localStorage.removeItem('abi_auth_token');
+          setAuthToken('');
+          setCurrentUser(null);
+        }
+      })
+      .catch(() => {
+        setCurrentUser(null);
+      })
+      .finally(() => {
+        setAuthChecking(false);
+      });
+  }, [authToken]);
 
   // Global dataset & filter state
   const [datasetMeta, setDatasetMeta] = useState<DatasetMeta | null>(null);
@@ -167,6 +226,10 @@ export default function App() {
   );
 
   const loadAllPlatformData = useCallback(async () => {
+    if (!currentUser) {
+      setLoadingCore(false);
+      return;
+    }
     setLoadingCore(true);
     setCoreError(null);
     try {
@@ -216,10 +279,10 @@ export default function App() {
     } finally {
       setLoadingCore(false);
     }
-  }, [currentFilters, trendInterval]);
+  }, [currentUser, currentFilters, trendInterval]);
 
   const loadMlModels = useCallback(async () => {
-    if (!datasetMeta) {
+    if (!currentUser || !datasetMeta) {
       setForecastData(null);
       setAnomalyData(null);
       return;
@@ -235,7 +298,7 @@ export default function App() {
     } catch (err) {
       console.error('ML load error:', err);
     }
-  }, [datasetMeta, currentFilters, forecastInterval, forecastHorizon, contamination]);
+  }, [currentUser, datasetMeta, currentFilters, forecastInterval, forecastHorizon, contamination]);
 
   useEffect(() => {
     loadAllPlatformData();
@@ -332,6 +395,163 @@ export default function App() {
     setEndDate('');
   };
 
+  const handleLoginSubmit = async (
+    e?: React.FormEvent,
+    overrideEmail?: string,
+    overridePassword?: string
+  ) => {
+    if (e) e.preventDefault();
+    const emailToUse = (overrideEmail ?? authEmail).trim().toLowerCase();
+    const passwordToUse = overridePassword ?? authPassword;
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+    if (!emailToUse || !passwordToUse) {
+      setAuthBanner({
+        type: 'error',
+        message: 'Please enter both your email address and password.',
+      });
+      return;
+    }
+    if (!emailPattern.test(emailToUse)) {
+      setAuthBanner({
+        type: 'error',
+        message: 'Please enter a valid email address (e.g., name@domain.com).',
+      });
+      return;
+    }
+    if (passwordToUse.length < 6) {
+      setAuthBanner({
+        type: 'error',
+        message: 'Password must be at least 6 characters.',
+      });
+      return;
+    }
+
+    setAuthSubmitting(true);
+    setAuthBanner(null);
+    try {
+      const res = await biApi.loginUser({ email: emailToUse, password: passwordToUse });
+      localStorage.setItem('abi_auth_token', res.token);
+      setAuthToken(res.token);
+      setCurrentUser(res.user);
+      setAuthPassword('');
+      setAuthConfirmPassword('');
+      setAuthBanner({
+        type: 'success',
+        message: res.message,
+      });
+      setActivePage('dashboard');
+    } catch (err) {
+      setAuthBanner({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Sign in failed.',
+      });
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleRegisterSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanName = authFullName.trim();
+    const cleanEmail = authEmail.trim().toLowerCase();
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+    if (!cleanName || !cleanEmail || !authPassword || !authConfirmPassword) {
+      setAuthBanner({
+        type: 'error',
+        message: 'All fields (Full Name, Email, Password, and Confirm Password) are required.',
+      });
+      return;
+    }
+    if (cleanName.length < 2 || !/[a-zA-Z]/.test(cleanName)) {
+      setAuthBanner({
+        type: 'error',
+        message: 'Full name must be at least 2 characters and contain letters.',
+      });
+      return;
+    }
+    if (!emailPattern.test(cleanEmail)) {
+      setAuthBanner({
+        type: 'error',
+        message: 'Please enter a valid email address (e.g., name@domain.com).',
+      });
+      return;
+    }
+    if (authPassword.length < 6 || !/[A-Za-z]/.test(authPassword) || !/[0-9]/.test(authPassword)) {
+      setAuthBanner({
+        type: 'error',
+        message: 'Password must be at least 6 characters and include at least 1 letter and 1 number.',
+      });
+      return;
+    }
+    if (authPassword !== authConfirmPassword) {
+      setAuthBanner({
+        type: 'error',
+        message: 'Passwords do not match. Please verify your Confirm Password field.',
+      });
+      return;
+    }
+
+    setAuthSubmitting(true);
+    setAuthBanner(null);
+    try {
+      const res = await biApi.registerUser({
+        full_name: cleanName,
+        email: cleanEmail,
+        password: authPassword,
+        role: authRole,
+      });
+      localStorage.setItem('abi_auth_token', res.token);
+      setAuthToken(res.token);
+      setCurrentUser(res.user);
+      setAuthPassword('');
+      setAuthConfirmPassword('');
+      setAuthBanner({
+        type: 'success',
+        message: res.message,
+      });
+      setActivePage('dashboard');
+    } catch (err) {
+      setAuthBanner({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Account registration failed.',
+      });
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      if (authToken) {
+        await biApi.logoutUser(authToken);
+      }
+    } catch (err) {
+      console.error('Logout error:', err);
+    } finally {
+      localStorage.removeItem('abi_auth_token');
+      setAuthToken('');
+      setCurrentUser(null);
+      setDatasetMeta(null);
+      setKpis(null);
+      setSalesTrend([]);
+      setCategorySales([]);
+      setBreakdowns(null);
+      setInsights([]);
+      setPreviewRows([]);
+      setForecastData(null);
+      setAnomalyData(null);
+      setQaHistory([]);
+      setAuthMode('signin');
+      setAuthBanner({
+        type: 'success',
+        message: 'You have been logged out successfully.',
+      });
+      setActivePage('dashboard');
+    }
+  };
+
   const navTabs: { id: NavPage; label: string; icon: React.ReactNode }[] = [
     { id: 'dashboard', label: 'Overview & KPIs', icon: <LayoutDashboard className="w-3.5 h-3.5" /> },
     { id: 'upload', label: 'Upload CSV Dataset', icon: <Upload className="w-3.5 h-3.5" /> },
@@ -374,16 +594,248 @@ export default function App() {
         >
           Go to CSV Uploader
         </button>
-        <a
-          href="/api/datasets/sample-download?type=clean"
-          download="retail_sales.csv"
-          className="px-4 py-2.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors flex items-center gap-1.5"
-        >
-          <Download className="w-3.5 h-3.5" /> Download Reference CSV File
-        </a>
       </div>
     </div>
   );
+
+  // If user is not signed in, render ONLY the Login / Sign In & Sign Up screen
+  if (!currentUser) {
+    return (
+      <div className="min-h-screen flex flex-col bg-[#F8FAFC] dark:bg-[#0B0F19] text-[#0F172A] dark:text-[#F8FAFC] transition-colors duration-150">
+        <header className="bg-white/95 dark:bg-[#0B0F19]/95 backdrop-blur border-b border-slate-200 dark:border-slate-800">
+          <div className="max-w-[1440px] mx-auto flex items-center justify-between gap-8 px-6 py-4">
+            <span className="text-lg font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap shrink-0 font-display">
+              Autonomous BI
+            </span>
+
+            <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg">
+              <button
+                onClick={() => setTheme('light')}
+                className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  theme === 'light'
+                    ? 'bg-white text-slate-900 shadow-sm'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <Sun className="w-3.5 h-3.5" /> Light
+              </button>
+              <button
+                onClick={() => setTheme('dark')}
+                className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  theme === 'dark'
+                    ? 'bg-slate-900 text-white shadow-sm'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <Moon className="w-3.5 h-3.5" /> Dark
+              </button>
+            </div>
+          </div>
+        </header>
+
+        <main className="flex-1 flex items-center justify-center px-6 py-12">
+          {authChecking ? (
+            <div className="text-sm text-slate-500 dark:text-slate-400">
+              Verifying workspace session...
+            </div>
+          ) : (
+            <div className="w-full max-w-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 sm:p-8 space-y-6">
+              <div className="space-y-1">
+                <h1 className="text-xl font-bold text-slate-900 dark:text-white">
+                  {authMode === 'signin'
+                    ? 'Login to Autonomous BI'
+                    : 'Create an Account'}
+                </h1>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  {authMode === 'signin'
+                    ? 'Sign in with your email and password to access the platform.'
+                    : 'Register a new account to access the analytics workspace.'}
+                </p>
+              </div>
+
+              {authBanner && (
+                <div
+                  className={`p-3.5 rounded-lg border text-xs flex items-center justify-between ${
+                    authBanner.type === 'success'
+                      ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-900 dark:text-emerald-200'
+                      : 'bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-900 dark:text-red-200'
+                  }`}
+                >
+                  <span>{authBanner.message}</span>
+                  <button
+                    onClick={() => setAuthBanner(null)}
+                    className="text-xs underline ml-3 cursor-pointer"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+
+              {/* Segmented Toggle: Sign In vs Sign Up */}
+              <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('signin');
+                    setAuthBanner(null);
+                  }}
+                  className={`flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                    authMode === 'signin'
+                      ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-sm'
+                      : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                  }`}
+                >
+                  <LogIn className="w-3.5 h-3.5" /> Login / Sign In
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('signup');
+                    setAuthBanner(null);
+                  }}
+                  className={`flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                    authMode === 'signup'
+                      ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-sm'
+                      : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                  }`}
+                >
+                  <UserPlus className="w-3.5 h-3.5" /> Sign Up
+                </button>
+              </div>
+
+              {authMode === 'signin' ? (
+                <form onSubmit={handleLoginSubmit} className="space-y-4">
+                  <div className="space-y-1.5">
+                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                      Email Address
+                    </label>
+                    <input
+                      type="email"
+                      required
+                      value={authEmail}
+                      onChange={(e) => setAuthEmail(e.target.value)}
+                      placeholder="you@example.com"
+                      className="w-full px-3.5 py-2.5 text-sm bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                      Password
+                    </label>
+                    <input
+                      type="password"
+                      required
+                      value={authPassword}
+                      onChange={(e) => setAuthPassword(e.target.value)}
+                      placeholder="Enter your password"
+                      className="w-full px-3.5 py-2.5 text-sm bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+
+                  <div className="pt-2">
+                    <button
+                      type="submit"
+                      disabled={authSubmitting}
+                      className="w-full px-6 py-2.5 text-xs font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors cursor-pointer"
+                    >
+                      {authSubmitting ? 'Signing In...' : 'Login / Sign In'}
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <form onSubmit={handleRegisterSubmit} className="space-y-4">
+                  <div className="space-y-1.5">
+                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                      Full Name
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={authFullName}
+                      onChange={(e) => setAuthFullName(e.target.value)}
+                      placeholder="Enter your full name"
+                      className="w-full px-3.5 py-2.5 text-sm bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                      Email Address
+                    </label>
+                    <input
+                      type="email"
+                      required
+                      value={authEmail}
+                      onChange={(e) => setAuthEmail(e.target.value)}
+                      placeholder="you@example.com"
+                      className="w-full px-3.5 py-2.5 text-sm bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                      Workspace Role
+                    </label>
+                    <select
+                      value={authRole}
+                      onChange={(e) => setAuthRole(e.target.value)}
+                      className="w-full px-3.5 py-2.5 text-sm bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
+                    >
+                      <option value="Lead BI Analyst">Lead BI Analyst</option>
+                      <option value="Retail Operations Manager">Retail Operations Manager</option>
+                      <option value="Executive Director">Executive Director</option>
+                      <option value="Data Scientist">Data Scientist</option>
+                    </select>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                      Password (min 6 chars, at least 1 letter & 1 number)
+                    </label>
+                    <input
+                      type="password"
+                      required
+                      minLength={6}
+                      value={authPassword}
+                      onChange={(e) => setAuthPassword(e.target.value)}
+                      placeholder="Create a password"
+                      className="w-full px-3.5 py-2.5 text-sm bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                      Confirm Password
+                    </label>
+                    <input
+                      type="password"
+                      required
+                      minLength={6}
+                      value={authConfirmPassword}
+                      onChange={(e) => setAuthConfirmPassword(e.target.value)}
+                      placeholder="Re-enter your password"
+                      className="w-full px-3.5 py-2.5 text-sm bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+
+                  <div className="pt-2">
+                    <button
+                      type="submit"
+                      disabled={authSubmitting}
+                      className="w-full px-6 py-2.5 text-xs font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors cursor-pointer"
+                    >
+                      {authSubmitting ? 'Creating Account...' : 'Sign Up & Login'}
+                    </button>
+                  </div>
+                </form>
+              )}
+            </div>
+          )}
+        </main>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F8FAFC] dark:bg-[#0B0F19] text-[#0F172A] dark:text-[#F8FAFC] transition-colors duration-150">
@@ -564,6 +1016,19 @@ export default function App() {
                 <Moon className="w-3.5 h-3.5" /> Dark
               </button>
             </div>
+
+            {/* User Account & Logout Controls (Only shown when signed in) */}
+            <div className="flex items-center gap-3 pl-2 border-l border-slate-200 dark:border-slate-800">
+              <span className="text-xs text-slate-700 dark:text-slate-300 font-medium whitespace-nowrap shrink-0">
+                {currentUser.full_name} · <span className="text-slate-500 dark:text-slate-400">{currentUser.role}</span>
+              </span>
+              <button
+                onClick={handleLogout}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800/60 rounded-lg hover:bg-red-100 dark:hover:bg-red-950/70 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <LogOut className="w-3.5 h-3.5" /> Logout
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -687,13 +1152,6 @@ export default function App() {
                       >
                         {uploading ? 'Validating CSV...' : 'Upload Retail Sales CSV'}
                       </button>
-                      <a
-                        href="/api/datasets/sample-download?type=clean"
-                        download="retail_sales.csv"
-                        className="px-5 py-3 text-sm font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors flex items-center gap-2"
-                      >
-                        <Download className="w-4 h-4" /> Download Sample CSV to Test
-                      </a>
                     </div>
                   </div>
 
@@ -1012,23 +1470,16 @@ export default function App() {
                 </h1>
               </div>
 
-              <div className="flex flex-wrap items-center gap-2.5">
-                <a
-                  href="/api/datasets/sample-download?type=clean"
-                  download="retail_sales.csv"
-                  className="px-3.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
-                >
-                  <Download className="w-3.5 h-3.5" /> Download Sample CSV File (retail_sales.csv)
-                </a>
-                {datasetMeta && (
+              {datasetMeta && (
+                <div className="flex flex-wrap items-center gap-2.5">
                   <button
                     onClick={handleClearWorkspace}
                     className="px-3.5 py-2 text-xs font-medium text-red-600 dark:text-red-400 bg-white dark:bg-slate-900 border border-red-200 dark:border-red-900/60 rounded-lg hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     <Trash2 className="w-3.5 h-3.5" /> Clear Active Dataset
                   </button>
-                )}
-              </div>
+                </div>
+              )}
             </div>
 
             {uploadBanner && (
@@ -1073,10 +1524,10 @@ export default function App() {
               </div>
               <div className="space-y-1 max-w-lg">
                 <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-                  Drag and drop your retail sales CSV file here
+                  Drag and drop any CSV dataset file here
                 </h2>
                 <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                  Expected columns: Transaction ID, Date, Customer ID, Gender, Age, Product Category, Quantity, Price per Unit, Total Amount (supports common column name variations up to 15 MB).
+                  Supports any tabular CSV dataset up to 15 MB (Retail, E-Commerce, Finance, SaaS, Inventory, or general metrics). Automatically maps or infers Date, Category/Dimension, Quantity, and Value/Revenue columns using header aliases and data-type heuristics.
                 </p>
               </div>
               <input
@@ -1550,8 +2001,82 @@ export default function App() {
                   </div>
                 </div>
 
-                {forecastData && (
+                {forecastData && !forecastData.available && (
+                  <div className="p-6 text-xs text-amber-800 dark:text-amber-200 bg-amber-50/70 dark:bg-amber-950/30">
+                    {forecastData.reason}
+                  </div>
+                )}
+
+                {forecastData && forecastData.available && (
                   <>
+                    {/* Simple Plain-English Explanation Banner */}
+                    <div className="p-6 bg-blue-50/50 dark:bg-blue-950/20 space-y-3">
+                      <div className="text-xs font-semibold uppercase tracking-wider text-blue-600 dark:text-blue-400">
+                        Simple Explanation — What This Forecast Means
+                      </div>
+                      <p className="text-sm text-slate-800 dark:text-slate-200 leading-relaxed">
+                        Based on your past sales records, your revenue is following an{' '}
+                        <strong>{forecastData.metrics.trend_direction.toLowerCase()} trend</strong> (changing by roughly{' '}
+                        <strong className="font-mono">
+                          {forecastData.metrics.slope_per_period >= 0 ? '+' : ''}
+                          {formatCurrencyINR(forecastData.metrics.slope_per_period)}
+                        </strong>{' '}
+                        per {forecastData.interval === 'monthly' ? 'month' : forecastData.interval === 'weekly' ? 'week' : 'day'}). Over the next{' '}
+                        <strong>
+                          {forecastData.horizon}{' '}
+                          {forecastData.interval === 'monthly' ? 'months' : forecastData.interval === 'weekly' ? 'weeks' : 'days'}
+                        </strong>
+                        , total sales are estimated to reach{' '}
+                        <strong className="font-mono text-emerald-700 dark:text-emerald-400">
+                          {formatCurrencyINR(forecastData.metrics.projected_horizon_total)}
+                        </strong>{' '}
+                        (an average of{' '}
+                        <strong className="font-mono">
+                          {formatCurrencyINR(
+                            forecastData.metrics.projected_horizon_total / Math.max(1, forecastData.horizon)
+                          )}
+                        </strong>{' '}
+                        per period, compared to your historical average of{' '}
+                        <strong className="font-mono">
+                          {formatCurrencyINR(forecastData.metrics.historical_period_avg)}
+                        </strong>
+                        ).
+                      </p>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1 text-xs">
+                        <div className="p-3 bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 rounded-md">
+                          <span className="font-semibold text-slate-900 dark:text-white">
+                            1. Blue Line vs Green Line:{' '}
+                          </span>
+                          <span className="text-slate-600 dark:text-slate-400">
+                            The <strong>Blue line</strong> shows your actual past sales. The <strong>Green line</strong> shows predicted future sales.
+                          </span>
+                        </div>
+                        <div className="p-3 bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 rounded-md">
+                          <span className="font-semibold text-slate-900 dark:text-white">
+                            2. Safe Range (95% Bounds):{' '}
+                          </span>
+                          <span className="text-slate-600 dark:text-slate-400">
+                            The shaded green area shows the realistic minimum (<strong>Lower Bound</strong>) and maximum (<strong>Upper Bound</strong>) sales range to plan for.
+                          </span>
+                        </div>
+                        <div className="p-3 bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 rounded-md">
+                          <span className="font-semibold text-slate-900 dark:text-white">
+                            3. Model Accuracy Check (MAE):{' '}
+                          </span>
+                          <span className="text-slate-600 dark:text-slate-400">
+                            We tested the model on your most recent {forecastData.metrics.test_periods} periods; its predictions were within{' '}
+                            <strong className="font-mono">
+                              {forecastData.metrics.mae !== null
+                                ? formatCurrencyINR(forecastData.metrics.mae)
+                                : 'N/A'}
+                            </strong>{' '}
+                            on average.
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
                     <div className="grid grid-cols-2 sm:grid-cols-5 divide-y sm:divide-y-0 sm:divide-x divide-slate-200 dark:divide-slate-800">
                       <div className="p-4 space-y-1">
                         <div className="text-xs text-slate-500 dark:text-slate-400">

@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'fs';
 import path from 'path';
@@ -51,6 +52,24 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_sales_dataset_date ON sales_transactions(dataset_id, date);
   CREATE INDEX IF NOT EXISTS idx_sales_dataset_category ON sales_transactions(dataset_id, product_category);
+
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    full_name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL DEFAULT 'Business Analyst',
+    password_salt TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS user_sessions (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
 `);
 
 export interface DatasetMetadata {
@@ -657,4 +676,192 @@ export function getAllActiveTransactions(filters: FilterParams = {}): RawRetailR
       ORDER BY date ASC, transaction_id ASC`
     )
     .all(...params) as unknown as RawRetailRow[];
+}
+
+export interface AuthUser {
+  id: number;
+  full_name: string;
+  email: string;
+  role: string;
+  created_at: string;
+}
+
+function hashPassword(password: string, salt: string): string {
+  return crypto.scryptSync(password, salt, 64).toString('hex');
+}
+
+// Clean up any previously seeded demo user so only real registered accounts exist
+db.prepare("DELETE FROM users WHERE lower(email) = 'admin@autonomousbi.com'").run();
+
+function createSessionForUser(userId: number): string {
+  const token = crypto.randomBytes(32).toString('hex');
+  const now = new Date();
+  const expires = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+  db.prepare(
+    `INSERT INTO user_sessions (token, user_id, created_at, expires_at)
+     VALUES (?, ?, ?, ?)`
+  ).run(token, userId, now.toISOString(), expires.toISOString());
+  return token;
+}
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+export function registerUserAccount(params: {
+  full_name: string;
+  email: string;
+  password: string;
+  role?: string;
+}): { user: AuthUser; token: string } {
+  const fullName = String(params.full_name || '').trim();
+  const email = String(params.email || '').trim().toLowerCase();
+  const password = String(params.password || '');
+  const role = String(params.role || 'Business Analyst').trim() || 'Business Analyst';
+
+  if (fullName.length < 2 || fullName.length > 80 || !/[a-zA-Z]/.test(fullName)) {
+    throw new Error('Full name must be between 2 and 80 characters and contain letters.');
+  }
+  if (!EMAIL_REGEX.test(email)) {
+    throw new Error('Please enter a valid email address (e.g., name@domain.com).');
+  }
+  if (password.length < 6) {
+    throw new Error('Password must be at least 6 characters long.');
+  }
+  if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+    throw new Error('Password must contain at least one letter and one number.');
+  }
+
+  const existing = db
+    .prepare('SELECT id FROM users WHERE lower(email) = lower(?)')
+    .get(email) as { id: number } | undefined;
+  if (existing) {
+    throw new Error('An account with this email address already exists. Please login instead.');
+  }
+
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = hashPassword(password, salt);
+  const createdAt = new Date().toISOString();
+
+  const info = db
+    .prepare(
+      `INSERT INTO users (full_name, email, role, password_salt, password_hash, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .run(fullName, email, role, salt, hash, createdAt);
+
+  const userId = Number(info.lastInsertRowid);
+  const token = createSessionForUser(userId);
+
+  return {
+    user: {
+      id: userId,
+      full_name: fullName,
+      email,
+      role,
+      created_at: createdAt,
+    },
+    token,
+  };
+}
+
+export function loginUserAccount(params: {
+  email: string;
+  password: string;
+}): { user: AuthUser; token: string } {
+  const email = String(params.email || '').trim().toLowerCase();
+  const password = String(params.password || '');
+
+  if (!email || !password) {
+    throw new Error('Please enter both your email address and password.');
+  }
+  if (!EMAIL_REGEX.test(email)) {
+    throw new Error('Please enter a valid email address format (e.g., name@domain.com).');
+  }
+
+  const row = db
+    .prepare(
+      `SELECT id, full_name, email, role, password_salt, password_hash, created_at
+       FROM users
+       WHERE lower(email) = lower(?)`
+    )
+    .get(email) as
+    | {
+        id: number;
+        full_name: string;
+        email: string;
+        role: string;
+        password_salt: string;
+        password_hash: string;
+        created_at: string;
+      }
+    | undefined;
+
+  if (!row) {
+    throw new Error('No account found with this email address. Please Sign Up first.');
+  }
+
+  const candidateHash = hashPassword(password, row.password_salt);
+  const valid = crypto.timingSafeEqual(
+    Buffer.from(candidateHash, 'hex'),
+    Buffer.from(row.password_hash, 'hex')
+  );
+
+  if (!valid) {
+    throw new Error('Incorrect password. Please check your password and try again.');
+  }
+
+  const token = createSessionForUser(row.id);
+  return {
+    user: {
+      id: Number(row.id),
+      full_name: String(row.full_name),
+      email: String(row.email),
+      role: String(row.role),
+      created_at: String(row.created_at),
+    },
+    token,
+  };
+}
+
+export function getUserFromSessionToken(token: string): AuthUser | null {
+  const cleanToken = String(token || '').trim();
+  if (!cleanToken) return null;
+
+  const row = db
+    .prepare(
+      `SELECT u.id, u.full_name, u.email, u.role, u.created_at, s.expires_at
+       FROM user_sessions s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.token = ?`
+    )
+    .get(cleanToken) as
+    | {
+        id: number;
+        full_name: string;
+        email: string;
+        role: string;
+        created_at: string;
+        expires_at: string;
+      }
+    | undefined;
+
+  if (!row) return null;
+
+  if (new Date(row.expires_at).getTime() < Date.now()) {
+    db.prepare('DELETE FROM user_sessions WHERE token = ?').run(cleanToken);
+    return null;
+  }
+
+  return {
+    id: Number(row.id),
+    full_name: String(row.full_name),
+    email: String(row.email),
+    role: String(row.role),
+    created_at: String(row.created_at),
+  };
+}
+
+export function revokeUserSessionToken(token: string): void {
+  const cleanToken = String(token || '').trim();
+  if (!cleanToken) return;
+  db.prepare('DELETE FROM user_sessions WHERE token = ?').run(cleanToken);
 }

@@ -139,20 +139,44 @@ export function runSalesForecast(
   filters: FilterParams = {}
 ): ForecastResult {
   const validIntervals = ['daily', 'weekly', 'monthly'];
-  const safeInterval = validIntervals.includes(interval) ? interval : 'monthly';
+  let safeInterval: 'daily' | 'weekly' | 'monthly' = validIntervals.includes(interval)
+    ? interval
+    : 'monthly';
+
+  let aggregated = getSalesTrend(safeInterval, filters);
+
+  // Automatically step down granularity if the dataset spans fewer than 3 periods at the chosen interval
+  if (aggregated.length < 3 && safeInterval === 'monthly') {
+    const weeklyTry = getSalesTrend('weekly', filters);
+    if (weeklyTry.length >= 3) {
+      safeInterval = 'weekly';
+      aggregated = weeklyTry;
+    } else {
+      const dailyTry = getSalesTrend('daily', filters);
+      if (dailyTry.length >= 2) {
+        safeInterval = 'daily';
+        aggregated = dailyTry;
+      }
+    }
+  } else if (aggregated.length < 3 && safeInterval === 'weekly') {
+    const dailyTry = getSalesTrend('daily', filters);
+    if (dailyTry.length >= 2) {
+      safeInterval = 'daily';
+      aggregated = dailyTry;
+    }
+  }
+
   const maxHorizon = safeInterval === 'daily' ? 60 : safeInterval === 'weekly' ? 24 : 12;
   const horizon = Math.min(maxHorizon, Math.max(1, Math.round(Number(horizonInput) || 6)));
 
-  const aggregated = getSalesTrend(safeInterval, filters);
-
-  if (aggregated.length < 4) {
+  if (aggregated.length < 2) {
     return {
       available: false,
-      reason: `Insufficient historical time periods (${aggregated.length} found; minimum 4 required for chronological train/test evaluation). Try switching to a finer aggregation interval (e.g., Weekly or Daily) or widening the date filter.`,
+      reason: `At least 2 chronological time periods are required to calculate a trend and forecast future sales (found ${aggregated.length}). Please upload a CSV with transactions across multiple dates.`,
       interval: safeInterval,
       horizon,
       category: filters.category || 'All',
-      model_name: 'Ordinary Least Squares (OLS) Linear Regression with Time-Index Features',
+      model_name: 'Ordinary Least Squares (OLS) Linear Regression',
       metrics: {
         mae: null,
         rmse: null,
@@ -171,7 +195,7 @@ export function runSalesForecast(
       methodology:
         'Chronological time-series aggregation followed by Ordinary Least Squares (OLS) Linear Regression.',
       limitations: [
-        'Requires at least 4 historical time intervals to split into chronological training and evaluation sets.',
+        'Requires at least 2 historical time periods to estimate a trend line.',
       ],
     };
   }
@@ -179,10 +203,10 @@ export function runSalesForecast(
   const N = aggregated.length;
   const yAll = aggregated.map((r) => r.total_sales);
 
-  // Build time-related features: [1 (intercept), t (linear time index), sin(2*pi*t/P), cos(2*pi*t/P)]
-  // For small N (< 8), use pure linear trend [1, t] to prevent overfitting
+  // Only include seasonal Fourier harmonics when at least 2 full seasonal cycles exist (N >= 24);
+  // otherwise use clean, interpretable OLS linear trend [1, t] to avoid overfitting short series.
   const periodCycle = safeInterval === 'monthly' ? 12 : safeInterval === 'weekly' ? 52 : 7;
-  const useHarmonics = N >= 10;
+  const useHarmonics = N >= 24;
 
   const buildFeatures = (t: number): number[] => {
     if (!useHarmonics) {
@@ -194,9 +218,9 @@ export function runSalesForecast(
 
   const XAll = aggregated.map((_, idx) => buildFeatures(idx));
 
-  // Chronological Train/Test split (80% train, 20% test, at least 2 test points when N >= 6)
+  // Chronological Train/Test split (80% train, 20% test)
   const testSize = N >= 6 ? Math.max(2, Math.round(N * 0.2)) : 1;
-  const trainSize = N - testSize;
+  const trainSize = Math.max(1, N - testSize);
 
   const XTrain = XAll.slice(0, trainSize);
   const yTrain = yAll.slice(0, trainSize);
@@ -211,18 +235,12 @@ export function runSalesForecast(
   let apeSum = 0;
   let validMapeCount = 0;
 
-  const yTestMean = yTest.reduce((a, b) => a + b, 0) / yTest.length;
-  let ssTot = 0;
-  let ssRes = 0;
-
   for (let i = 0; i < XTest.length; i++) {
     const pred = predictRow(XTest[i], betaTrain);
     const actual = yTest[i];
     const err = actual - pred;
     absErrSum += Math.abs(err);
     sqErrSum += err * err;
-    ssRes += err * err;
-    ssTot += (actual - yTestMean) * (actual - yTestMean);
     if (actual > 0) {
       apeSum += Math.abs(err / actual);
       validMapeCount++;
@@ -233,7 +251,7 @@ export function runSalesForecast(
   const rmse = Number(Math.sqrt(sqErrSum / XTest.length).toFixed(2));
   const mapePct = validMapeCount > 0 ? Number(((apeSum / validMapeCount) * 100).toFixed(2)) : null;
 
-  // Also compute overall R^2 on full fit to report model goodness of fit
+  // Fit on full historical series for future projection
   const betaFull = fitOlsLinearRegression(XAll, yAll);
   const yMeanAll = yAll.reduce((a, b) => a + b, 0) / N;
   let fullSsTot = 0;
@@ -243,10 +261,10 @@ export function runSalesForecast(
     fullSsRes += (yAll[i] - fitVal) ** 2;
     fullSsTot += (yAll[i] - yMeanAll) ** 2;
   }
-  const r2Score = fullSsTot > 0 ? Number(Math.max(-1, 1 - fullSsRes / fullSsTot).toFixed(3)) : 0;
+  const r2Score = fullSsTot > 0 ? Number(Math.max(0, 1 - fullSsRes / fullSsTot).toFixed(3)) : 0;
   const residualStd = Math.sqrt(fullSsRes / Math.max(1, N - betaFull.length));
 
-  // Also fit pure linear trend [1, t] to get clean interpretable slope_per_period
+  // Clean linear trend [1, t] for interpretable slope_per_period
   const betaLinear = fitOlsLinearRegression(
     aggregated.map((_, idx) => [1, idx]),
     yAll
@@ -258,13 +276,14 @@ export function runSalesForecast(
 
   for (let i = 0; i < N; i++) {
     const fitted = Number(predictRow(XAll[i], betaFull).toFixed(2));
+    const isLastHistorical = i === N - 1;
     series.push({
       period: aggregated[i].period,
       actual_sales: aggregated[i].total_sales,
       fitted_sales: fitted,
-      forecast_sales: i === N - 1 ? fitted : null, // Bridge line cleanly on chart
-      lower_bound: null,
-      upper_bound: null,
+      forecast_sales: isLastHistorical ? aggregated[i].total_sales : null,
+      lower_bound: isLastHistorical ? aggregated[i].total_sales : null,
+      upper_bound: isLastHistorical ? aggregated[i].total_sales : null,
       split: i < trainSize ? 'train' : 'test',
     });
   }

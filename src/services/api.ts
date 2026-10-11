@@ -8,6 +8,14 @@ export interface FilterQuery {
   search?: string;
 }
 
+export interface AuthUser {
+  id: number;
+  full_name: string;
+  email: string;
+  role: string;
+  created_at: string;
+}
+
 export interface DatasetMeta {
   id: number;
   filename: string;
@@ -201,8 +209,23 @@ function buildQueryString(params: Record<string, string | number | undefined>): 
   return str ? `?${str}` : '';
 }
 
+function getStoredAuthToken(): string {
+  if (typeof window !== 'undefined') {
+    return localStorage.getItem('abi_auth_token') || '';
+  }
+  return '';
+}
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, init);
+  const token = getStoredAuthToken();
+  const headers = new Headers(init?.headers || {});
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    ...init,
+    headers,
+  });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(data.error || `Request failed with HTTP ${response.status}`);
@@ -211,6 +234,56 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const biApi = {
+  registerUser: (payload: {
+    full_name: string;
+    email: string;
+    password: string;
+    role?: string;
+  }) =>
+    requestJson<{
+      authenticated: boolean;
+      message: string;
+      user: AuthUser;
+      token: string;
+    }>('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+
+  loginUser: (payload: { email: string; password: string }) =>
+    requestJson<{
+      authenticated: boolean;
+      message: string;
+      user: AuthUser;
+      token: string;
+    }>('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+
+  getCurrentUser: (token: string) =>
+    requestJson<{
+      authenticated: boolean;
+      user: AuthUser | null;
+    }>('/api/auth/me', {
+      headers: { Authorization: `Bearer ${token}` },
+    }),
+
+  logoutUser: (token: string) =>
+    requestJson<{
+      logged_out: boolean;
+      message: string;
+    }>('/api/auth/logout', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ token }),
+    }),
+
   getHealth: () =>
     requestJson<{
       status: string;
@@ -444,9 +517,13 @@ export const biApi = {
     anomaly_contamination?: number;
     filters?: FilterQuery;
   }) => {
+    const token = getStoredAuthToken();
     const response = await fetch(`${API_BASE_URL}/api/reports/generate`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
       body: JSON.stringify(config),
     });
     if (!response.ok) {
